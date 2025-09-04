@@ -1,0 +1,6 @@
+openai>=1.10.0
+requests
+python-telegram-bot==21.6
+fastapi
+uvicorn
+python-dotenv
