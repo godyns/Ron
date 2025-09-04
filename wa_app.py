@@ -24,33 +24,45 @@ def verify(
     return PlainTextResponse("forbidden", status_code=403)
 
 @app.post("/webhook")
-async def inbound(req: Request):
-    body = await req.json()
+async def inbound(request: Request):
     try:
-        entry = body["entry"][0]["changes"][0]["value"]
-        if "messages" not in entry:
+        data = await request.json()
+        entry = data["entry"][0]["changes"][0]["value"]
+        messages = entry.get("messages", [])
+        if not messages:
             return {"status": "ignored"}
-        msg = entry["messages"][0]
+        
+        msg = messages[0]
+        # Only process text messages
         if msg.get("type") != "text":
             return {"status": "ignored"}
-        from_id = msg["from"]
-        text = msg["text"]["body"]
-    except Exception:
+            
+        user_text = msg["text"]["body"]
+        user_number = msg["from"]
+
+        # Get Ron's reply
+        # The user_id parameter might not be supported by older versions of llm_brain
+        try:
+            ron_reply = reply_as_ron(user_text, user_id=user_number)
+        except TypeError:
+            ron_reply = reply_as_ron(user_text)
+
+        # Send back via WhatsApp Cloud API
+        url = f"https://graph.facebook.com/v20.0/{PHONE_NUMBER_ID}/messages"
+        headers = {
+            "Authorization": f"Bearer {WA_TOKEN}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": user_number,
+            "type": "text",
+            "text": {"body": ron_reply},
+        }
+        requests.post(url, headers=headers, json=payload, timeout=30)
+
+    except Exception as e:
+        print("Webhook error:", e, data)
         return {"status": "ignored"}
 
-    try:
-        try:
-            reply = reply_as_ron(text, user_id=from_id)
-        except TypeError:
-            reply = reply_as_ron(text)
-    except Exception:
-        reply = "oops, thoda glitch hua 😅 fir se bhej de?"
-
-    url = f"https://graph.facebook.com/v20.0/{PHONE_NUMBER_ID}/messages"
-    headers = {"Authorization": f"Bearer {WA_TOKEN}", "Content-Type": "application/json"}
-    payload = {"messaging_product":"whatsapp","to":from_id,"type":"text","text":{"body":reply}}
-    try:
-        requests.post(url, json=payload, headers=headers, timeout=30)
-    except Exception:
-        pass
-    return {"status":"ok"}
+    return {"status": "ok"}
