@@ -1,5 +1,5 @@
 import os, requests
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Query
 from fastapi.responses import PlainTextResponse
 from llm_brain import reply_as_ron
 
@@ -14,9 +14,13 @@ def root():
     return {"ok": True, "service": "ron-wa"}
 
 @app.get("/webhook")
-def verify(mode: str = "", challenge: str = "", token: str = ""):
-    if mode == "subscribe" and token == VERIFY_TOKEN:
-        return PlainTextResponse(challenge, status_code=200)
+def verify(
+    hub_mode: str | None = Query(None, alias="hub.mode"),
+    hub_challenge: str | None = Query(None, alias="hub.challenge"),
+    hub_verify_token: str | None = Query(None, alias="hub.verify_token"),
+):
+    if hub_mode == "subscribe" and hub_verify_token == VERIFY_TOKEN:
+        return PlainTextResponse(hub_challenge or "", status_code=200)
     return PlainTextResponse("forbidden", status_code=403)
 
 @app.post("/webhook")
