@@ -17,11 +17,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or ""
     log.info("MSG from %s: %s", uid, text)
     try:
-        # Try new signature first (with user_id). If your llm_brain doesn't have it, fall back.
-        try:
-            out = reply_as_ron(text, user_id=uid)  # if this raises TypeError, we fall back
-        except TypeError:
-            out = reply_as_ron(text)
+        out = reply_as_ron(text, user_id=uid)
         await update.message.reply_text(out)
     except Exception as e:
         log.exception("Error handling message: %s", e)

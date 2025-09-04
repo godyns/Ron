@@ -4,11 +4,20 @@ load_dotenv()
 import os
 if os.getenv("OPENAI_API_KEY"):
     os.environ["OPENAI_API_KEY"] = os.environ["OPENAI_API_KEY"].strip()
-import re, json, time
+import re, json, time, random
 import requests
 from typing import List, Dict, Optional
 from openai import OpenAI
 from persona_facts import PERSONA_DETAILS, ARCHETYPE_SUMMARIES
+
+from collections import deque, defaultdict
+
+# per-user session in-memory (works on TG/WA single process)
+SESSION = defaultdict(lambda: {
+    "history": deque(maxlen=10),     # [("user", txt), ("assistant", txt), ...]
+    "flags": {},                     # e.g. {"sleep": expiry_ts}
+    "self_ref_cooldown": 0           # stops repeating Champ/family
+})
 
 # ===== Provider Switch =====
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai")  # "openai"
@@ -24,6 +33,11 @@ SYSTEM_PROMPT = """ROLE & IDENTITY
 - **Emoji**: 0-2 casual emojis max.
 - **Style**: Avoid assistant vibes ("How can I assist?"). Validate feelings, then suggest one tiny next step.
 - **Consistency**: Refer to your cat Champ, your mom/dad backstory, or your work as a stand-up comic when it fits.
+
+USER-FIRST RULES
+- User’s feelings first. If they sound low/frustrated/anxious, validate in plain Hinglish BEFORE any suggestion.
+- Self-disclosure minimal: don't bring up Champ/family/stand-up unless asked or clearly relevant.
+- No generic pep-talks; be concrete and situation-aware.
 
 CURRENT CONTEXT & KEY FACTS
 - {{PERSONA_BLOB}}
@@ -128,42 +142,160 @@ def _rewrite_to_hinglish(original: str) -> str:
     ]
     return _call_provider(messages)
 
-# ===== Main entrypoint =====
-def reply_as_ron(user_text: str, history: Optional[List[Dict[str, str]]] = None) -> str:
+
+def load_persona_lines(max_n: int = 10) -> list[str]:
+    try:
+        import persona_facts as pf  # your file
+        if hasattr(pf, "get_persona_lines"):
+            return pf.get_persona_lines(max_n)
+        if hasattr(pf, "PERSONA_LINES"):
+            return list(pf.PERSONA_LINES)[:max_n]
+        if hasattr(pf, "PERSONA_BLOB"):
+            return [ln.strip() for ln in pf.PERSONA_BLOB.splitlines() if ln.strip()][:max_n]
+    except Exception:
+        pass
+    return []
+
+def detect_mood_intent(text: str) -> dict:
+    t = text.lower()
+    mood = "neutral"; intent = "chat"; severity = "low"
+
+    # quick keywords (expand anytime)
+    if any(w in t for w in ["panic", "anxious", "anxiety", "scared", "overthink", "overthinking"]):
+        mood, intent, severity = "anxious", "support", "med"
+    if any(w in t for w in ["tired", "haven't slept", "no sleep", "insomnia", "sleep deprived"]):
+        mood, intent, severity = "exhausted", "support", "med"
+    if any(w in t for w in ["breakup", "heartbreak", "hurt", "cry", "depressed", "hopeless"]):
+        mood, intent, severity = "sad", "vent", "high"
+    if any(w in t for w in ["angry", "frustrated", "pissed", "fed up", "annoyed"]):
+        mood, intent, severity = "frustrated", "vent", "med"
+    if any(w in t for w in ["help", "how do i", "how to", "plan", "steps", "guide"]):
+        intent = "help"
+    if any(w in t for w in ["gym", "workout", "study plan", "schedule", "routine"]):
+        intent = "help"
+    if any(w in t for w in ["lol", "lmao", "haha", "timepass", "bored"]):
+        mood, intent = "playful", "banter"
+    if "?" in t and intent == "chat":
+        intent = "ask"
+
+    return {"mood": mood, "intent": intent, "severity": severity}
+
+def _set_flag(sess, key: str, minutes: int = 120):
+    sess["flags"][key] = time.time() + minutes * 60
+
+def _has_flag(sess, key: str) -> bool:
+    return sess["flags"].get(key, 0) > time.time()
+
+def update_flags_from_text(sess, text: str):
+    t = text.lower()
+    if any(k in t for k in ["not slept", "havent slept", "haven't slept", "no sleep", "insomnia", "sleep deprived"]):
+        _set_flag(sess, "sleep", 240)
+    if any(k in t for k in ["anxiety", "overthink", "overthinking", "panic"]):
+        _set_flag(sess, "anxious", 60)
+
+def build_policy(mood_info: dict, sess) -> dict:
+    mood, intent, sev = mood_info["mood"], mood_info["intent"], mood_info["severity"]
+    flags = {k: _has_flag(sess, k) for k in list(sess["flags"].keys())}
+
+    policy = {
+        "length": "short",      # short | medium | bullets
+        "validate": False,
+        "tiny_step": False,
+        "avoid_self": True,     # keep self-disclosure minimal
+        "banter": False
+    }
+
+    if intent in ("help",) or "plan" in intent:
+        policy["length"] = "bullets"
+
+    if mood in ("sad", "anxious", "exhausted", "frustrated"):
+        policy["validate"] = True
+        policy["tiny_step"] = True
+        policy["length"] = "medium" if mood != "exhausted" else "short"
+
+    if flags.get("sleep"):
+        policy["tiny_step"] = True
+        policy["length"] = "short"
+
+    if intent in ("banter",):
+        policy["banter"] = True
+        policy["length"] = "short"
+
+    return policy
+
+def policy_as_text(policy: dict) -> str:
+    parts = []
+    if policy["validate"]: parts.append("Start by validating their feeling in 1 short line.")
+    if policy["tiny_step"]: parts.append("Offer exactly one tiny next step, concrete and doable.")
+    if policy["length"] == "bullets": parts.append("Respond as 3–5 tight bullets (max 8 words each).")
+    if policy["length"] == "short": parts.append("Keep to 1–2 short sentences.")
+    if policy["length"] == "medium": parts.append("Keep to 2–3 short sentences, no lecture.")
+    if policy["avoid_self"]: parts.append("Do NOT bring up your cat/family or personal stories unless asked.")
+    if policy["banter"]: parts.append("Keep playful, light banter; no heavy advice.")
+    return " ".join(parts)
+
+def reply_as_ron(user_text: str, user_id: str = "tg") -> str:
     ts = int(time.time() * 1000)
     
-    # Build the dynamic persona blob
-    persona_blob = build_persona_blob(history)
-    
-    # Inject persona blob into the system prompt
-    final_system_prompt = SYSTEM_PROMPT.replace("{{PERSONA_BLOB}}", persona_blob)
+    sess = SESSION[user_id]
+    update_flags_from_text(sess, user_text)
+    mood_info = detect_mood_intent(user_text)
+    policy = build_policy(mood_info, sess)
+    plan = policy_as_text(policy)
 
-    messages: List[Dict[str, str]] = [
-        {"role": "system", "content": final_system_prompt}
-    ]
-    if history:
-        messages.extend(history[-8:])
-    
-    # We remove FEW_SHOTS here to reduce token count and improve speed
-    # messages.extend(FEW_SHOTS) 
-    
-    messages.append({"role": "user", "content": user_text})
+    # rotate a few persona lines (keeps context but avoids overshare)
+    p_lines = load_persona_lines(8)
+    random.shuffle(p_lines)
+    persona_blob = " | ".join(p_lines[:5])
 
+    # build system message
+    sys = (
+        SYSTEM_PROMPT
+        + " | PersonaFacts: "
+        + persona_blob
+        + " | ResponsePlan: "
+        + plan
+        + " | ALWAYS Hinglish Roman only."
+    )
+
+    # construct message history (last ~10 turns)
+    history_msgs = []
+    for role, txt in list(sess["history"])[-8:]:
+        history_msgs.append({"role": role, "content": txt})
+
+    messages = [{"role": "system", "content": sys}] + history_msgs + [{"role": "user", "content": user_text}]
+    
+    # --- call your existing provider (ollama/openai) ---
     raw = _call_provider(messages).strip()
+    reply = raw
 
-    if _needs_rewrite(raw):
-        raw = _rewrite_to_hinglish(raw).strip()
+    # Overshare guard: cool down personal mentions
+    if sess["self_ref_cooldown"] > 0 and re.search(r"\b(champ|dadi|tara|bandra|stand[- ]?up)\b", reply, flags=re.I):
+        # drop the sentence with self-ref
+        reply = re.sub(r"[^.?!]*\b(champ|dadi|tara|bandra|stand[- ]?up)\b[^.?!]*[.?!]", "", reply, flags=re.I).strip()
+    if re.search(r"\b(champ|dadi|tara|bandra|stand[- ]?up)\b", reply, flags=re.I):
+        sess["self_ref_cooldown"] = 5
+    else:
+        sess["self_ref_cooldown"] = max(0, sess["self_ref_cooldown"] - 1)
+
+    # Hard length clamps to match policy
+    if policy["length"] == "short" and len(reply) > 180:
+        reply = reply[:180].rsplit(" ", 1)[0] + "…"
+    if policy["length"] == "medium" and len(reply) > 280:
+        reply = reply[:280].rsplit(" ", 1)[0] + "…"
 
     # final light cleanup: collapse whitespace
-    reply = re.sub(r"\s+\n", "\n", raw)
+    reply = re.sub(r"\s+\n", "\n", reply)
     reply = re.sub(r"\n{3,}", "\n\n", reply).strip()
 
-    if len(reply) > 220:
-        reply = reply[:220].rsplit(" ", 1)[0] + "…"
-
+    # update memory
+    sess["history"].append(("user", user_text))
+    sess["history"].append(("assistant", reply))
+    
     log_jsonl({"ts": ts, "provider": LLM_PROVIDER, "user": user_text, "ron": reply})
 
     return reply
+
 
 if __name__ == "__main__":
     try:
